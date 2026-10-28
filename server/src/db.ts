@@ -1,18 +1,15 @@
-import pkg from "pg";
-const { Pool } = pkg;
+import { MongoClient, Db, Collection } from "mongodb";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 
-// PostgreSQL Pool Connection
-export const pool = new Pool({
-  host: process.env.PG_HOST || "localhost",
-  port: Number(process.env.PG_PORT) || 5432,
-  user: process.env.PG_USER || "postgres",
-  password: process.env.PG_PASSWORD || "help",
-  database: process.env.PG_DATABASE || "postgres",
-});
+export const MONGO_URI =
+  process.env.MONGO_URI ||
+  "mongodb+srv://kishankumarhv5_db_user:AoJqQnF57zkBXgWe@cluster0.fqxsirr.mongodb.net/?appName=Cluster0";
 
+export const DB_NAME = "chatvia";
+
+// Password hashing helper
 export function hashPassword(password: string): string {
   return crypto.createHash("sha256").update(password).digest("hex");
 }
@@ -22,7 +19,7 @@ export function generateUserIdCode(): string {
   return `UID-${randomNum}`;
 }
 
-// Storage folders structure setup
+// Storage Directories
 export const STORAGE_DIR = path.resolve("./storage");
 export const CHAT_DIR = path.join(STORAGE_DIR, "chat");
 export const IMAGES_DIR = path.join(STORAGE_DIR, "images");
@@ -37,191 +34,528 @@ export function initStorageFolders() {
   });
 }
 
-// Save chat transcript to storage/chat/ folder
 export function backupChatToFile(user1: string, user2: string, messages: any[]) {
   try {
+    initStorageFolders();
     const pairKey = [user1, user2].sort().join("_");
     const filePath = path.join(CHAT_DIR, `chat_${pairKey}.json`);
     fs.writeFileSync(filePath, JSON.stringify(messages, null, 2), "utf-8");
   } catch (err) {
-    console.error("Failed to write chat file to storage/chat:", err);
+    console.error("Failed to backup chat transcript to disk:", err);
   }
 }
 
-export async function initDatabase() {
+// MongoDB Models
+export interface UserRecord {
+  id: string;
+  userIdCode: string;
+  username: string;
+  email: string;
+  fullName: string;
+  passwordHash: string;
+  avatar: string;
+  bio?: string;
+  createdAt: string;
+}
+
+export interface FriendRequestRecord {
+  id: string;
+  senderId: string;
+  receiverId: string;
+  status: "pending" | "accepted" | "rejected";
+  createdAt: string;
+}
+
+export interface MessageRecord {
+  id: string;
+  senderId: string;
+  receiverId: string;
+  content: string;
+  messageType: "text" | "image" | "file";
+  fileUrl?: string | null;
+  fileName?: string | null;
+  fileSize?: string | null;
+  timestamp: string;
+  securityScore?: number;
+  securityLevel?: "safe" | "low" | "medium" | "high" | "critical";
+  threatDetails?: string | null;
+  integrityHash?: string | null;
+  latencyMs?: number;
+}
+
+export interface DiagnosticRecord {
+  id: string;
+  timestamp: string;
+  errorCode: string;
+  category: string;
+  severity: string;
+  title: string;
+  rootCause: string;
+  recommendedAction: string;
+  technicalDetails?: string;
+}
+
+// MongoClient instance
+export const mongoClient = new MongoClient(MONGO_URI, {
+  serverSelectionTimeoutMS: 20000,
+  connectTimeoutMS: 20000,
+  maxPoolSize: 20,
+});
+
+let db: Db;
+let usersColl: Collection<UserRecord>;
+let friendRequestsColl: Collection<FriendRequestRecord>;
+let messagesColl: Collection<MessageRecord>;
+let diagnosticsColl: Collection<DiagnosticRecord>;
+export let isMongoConnected = false;
+
+// Initialize MongoDB Connection (Clean, No Demo Users - 100% Real User Driven)
+export async function initDatabase(): Promise<void> {
   initStorageFolders();
 
-  const client = await pool.connect();
-  try {
-    // 1. Create tables
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id VARCHAR(64) PRIMARY KEY,
-        user_id_code VARCHAR(32) UNIQUE NOT NULL,
-        username VARCHAR(64) UNIQUE NOT NULL,
-        email VARCHAR(128) UNIQUE NOT NULL,
-        full_name VARCHAR(128) NOT NULL,
-        password_hash VARCHAR(128) NOT NULL,
-        avatar TEXT,
-        bio TEXT DEFAULT 'Hey there! I am using Chatvia.',
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-      );
+  let retries = 3;
+  while (retries > 0) {
+    try {
+      console.log(`Connecting to MongoDB Atlas (attempts remaining: ${retries})...`);
+      await mongoClient.connect();
+      db = mongoClient.db(DB_NAME);
+      usersColl = db.collection<UserRecord>("users");
+      friendRequestsColl = db.collection<FriendRequestRecord>("friend_requests");
+      messagesColl = db.collection<MessageRecord>("messages");
+      diagnosticsColl = db.collection<DiagnosticRecord>("diagnostics");
+      isMongoConnected = true;
 
-      CREATE TABLE IF NOT EXISTS friend_requests (
-        id VARCHAR(64) PRIMARY KEY,
-        sender_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
-        receiver_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
-        status VARCHAR(20) DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected')),
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(sender_id, receiver_id)
-      );
+      // Ensure clean indexes
+      await usersColl.createIndex({ id: 1 }, { unique: true });
+      await usersColl.createIndex({ userIdCode: 1 }, { unique: true });
+      await usersColl.createIndex({ username: 1 }, { unique: true });
+      await usersColl.createIndex({ email: 1 }, { unique: true });
+      await friendRequestsColl.createIndex({ senderId: 1, receiverId: 1 });
+      await messagesColl.createIndex({ senderId: 1, receiverId: 1, timestamp: 1 });
 
-      CREATE TABLE IF NOT EXISTS messages (
-        id VARCHAR(64) PRIMARY KEY,
-        sender_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
-        receiver_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
-        content TEXT NOT NULL,
-        message_type VARCHAR(20) DEFAULT 'text' CHECK(message_type IN ('text', 'image', 'file')),
-        file_url TEXT,
-        file_name VARCHAR(255),
-        file_size VARCHAR(64),
-        timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_messages_pair_pg ON messages (sender_id, receiver_id, timestamp);
-      CREATE INDEX IF NOT EXISTS idx_users_id_code ON users (user_id_code);
-      CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
-    `);
-
-    // 2. Check if users table is empty; if so, seed demo users
-    const userCountRes = await client.query("SELECT COUNT(*) FROM users");
-    const count = parseInt(userCountRes.rows[0].count, 10);
-
-    if (count === 0) {
-      console.log("Seeding initial users into PostgreSQL...");
-
-      const demoUsers = [
-        {
-          id: "u_doris",
-          user_id_code: "UID-1001",
-          username: "doris",
-          email: "doris@gmail.com",
-          fullName: "Doris Brown",
-          passwordHash: hashPassword("doris123"),
-          avatar: "https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150",
-          bio: "Product Designer & Tech Enthusiast 🎨",
-        },
-        {
-          id: "u_patrick",
-          user_id_code: "UID-1002",
-          username: "patrick",
-          email: "patrick@gmail.com",
-          fullName: "Patrick Hendricks",
-          passwordHash: hashPassword("patrick123"),
-          avatar: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150",
-          bio: "Software Architect & Coffee lover ☕",
-        },
-        {
-          id: "u_steve",
-          user_id_code: "UID-1003",
-          username: "steve",
-          email: "steve@gmail.com",
-          fullName: "Steve Walker",
-          passwordHash: hashPassword("steve123"),
-          avatar: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150",
-          bio: "DevOps Engineer | Cloud Infrastructure ☁️",
-        },
-        {
-          id: "u_mark",
-          user_id_code: "UID-1004",
-          username: "mark",
-          email: "mark@gmail.com",
-          fullName: "Mark Messer",
-          passwordHash: hashPassword("mark123"),
-          avatar: "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150",
-          bio: "Full-Stack Developer 💻",
-        },
-        {
-          id: "u_emily",
-          user_id_code: "UID-1005",
-          username: "emily",
-          email: "emily@gmail.com",
-          fullName: "Emily Clark",
-          passwordHash: hashPassword("emily123"),
-          avatar: "https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=150",
-          bio: "UI/UX Researcher & Writer 📚",
-        },
-      ];
-
-      for (const u of demoUsers) {
-        await client.query(
-          `INSERT INTO users (id, user_id_code, username, email, full_name, password_hash, avatar, bio)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-           ON CONFLICT (id) DO NOTHING`,
-          [u.id, u.user_id_code, u.username, u.email, u.fullName, u.passwordHash, u.avatar, u.bio]
-        );
+      const userCount = await usersColl.countDocuments();
+      console.log(`✅ Connected to MongoDB Atlas: ${DB_NAME} at Cluster0! Real users count: ${userCount}`);
+      return;
+    } catch (err: any) {
+      retries--;
+      console.warn(`Connection attempt failed: ${err.message}. Retrying in 2s...`);
+      if (retries === 0) {
+        isMongoConnected = false;
+        throw err;
       }
-
-      // Seed accepted friendships
-      // Doris & Patrick are friends
-      await client.query(
-        `INSERT INTO friend_requests (id, sender_id, receiver_id, status)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (sender_id, receiver_id) DO NOTHING`,
-        ["fr_1", "u_patrick", "u_doris", "accepted"]
-      );
-
-      // Doris & Mark are friends
-      await client.query(
-        `INSERT INTO friend_requests (id, sender_id, receiver_id, status)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (sender_id, receiver_id) DO NOTHING`,
-        ["fr_2", "u_mark", "u_doris", "accepted"]
-      );
-
-      // Seed initial messages matching screenshot
-      const initialMessages = [
-        {
-          id: "m_1",
-          senderId: "u_doris",
-          receiverId: "u_patrick",
-          content: "Good morning",
-          messageType: "text",
-          timestamp: new Date(Date.now() - 3600000),
-        },
-        {
-          id: "m_2",
-          senderId: "u_doris",
-          receiverId: "u_patrick",
-          content: "Yeah everything is fine",
-          messageType: "text",
-          timestamp: new Date(Date.now() - 3500000),
-        },
-        {
-          id: "m_3",
-          senderId: "u_doris",
-          receiverId: "u_patrick",
-          content: "& Next meeting tomorrow 10.00AM",
-          messageType: "text",
-          timestamp: new Date(Date.now() - 3400000),
-        },
-      ];
-
-      for (const m of initialMessages) {
-        await client.query(
-          `INSERT INTO messages (id, sender_id, receiver_id, content, message_type, timestamp)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT (id) DO NOTHING`,
-          [m.id, m.senderId, m.receiverId, m.content, m.messageType, m.timestamp]
-        );
-      }
-
-      // Backup initial conversation to storage/chat
-      backupChatToFile("u_doris", "u_patrick", initialMessages);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
-
-    console.log("PostgreSQL database initialized successfully.");
-  } finally {
-    client.release();
   }
 }
+
+// Change Stream Setup for Live Feed from MongoDB Atlas
+export function watchMongoLiveFeed(onLiveEvent: (event: { collection: string; operation: string; document: any }) => void) {
+  if (!isMongoConnected) return;
+
+  try {
+    const messageStream = messagesColl.watch([], { fullDocument: "updateLookup" });
+    messageStream.on("change", (change) => {
+      if (change.operationType === "insert" && change.fullDocument) {
+        onLiveEvent({
+          collection: "messages",
+          operation: "insert",
+          document: change.fullDocument,
+        });
+      }
+    });
+
+    const friendStream = friendRequestsColl.watch([], { fullDocument: "updateLookup" });
+    friendStream.on("change", (change) => {
+      onLiveEvent({
+        collection: "friend_requests",
+        operation: change.operationType,
+        document: (change as any).fullDocument,
+      });
+    });
+
+    console.log("⚡ MongoDB Atlas Live Feed Change Streams active.");
+  } catch (e: any) {
+    console.warn("MongoDB Change Streams notice (requires replica set):", e.message);
+  }
+}
+
+// Unified Database Service using MongoDB Atlas
+export const dbService = {
+  getDbStatus(): string {
+    return isMongoConnected
+      ? "MongoDB Atlas (Connected • Cluster0 Live Feed 🍃)"
+      : "MongoDB Atlas (Connecting...)";
+  },
+
+  async findUserByUsernameOrEmail(username?: string, email?: string): Promise<UserRecord | null> {
+    const cleanUname = username?.trim().toLowerCase();
+    const cleanEmail = email?.trim().toLowerCase();
+
+    const query: any = {};
+    if (cleanUname && cleanEmail) {
+      query.$or = [{ username: cleanUname }, { email: cleanEmail }];
+    } else if (cleanUname) {
+      query.username = cleanUname;
+    } else if (cleanEmail) {
+      query.email = cleanEmail;
+    }
+
+    const doc = await usersColl.findOne(query);
+    if (!doc) return null;
+    return {
+      id: doc.id,
+      userIdCode: doc.userIdCode,
+      username: doc.username,
+      email: doc.email,
+      fullName: doc.fullName,
+      passwordHash: doc.passwordHash,
+      avatar: doc.avatar,
+      bio: doc.bio,
+      createdAt: doc.createdAt,
+    };
+  },
+
+  async findUserById(id: string): Promise<UserRecord | null> {
+    const doc = await usersColl.findOne({ id });
+    if (!doc) return null;
+    return {
+      id: doc.id,
+      userIdCode: doc.userIdCode,
+      username: doc.username,
+      email: doc.email,
+      fullName: doc.fullName,
+      passwordHash: doc.passwordHash,
+      avatar: doc.avatar,
+      bio: doc.bio,
+      createdAt: doc.createdAt,
+    };
+  },
+
+  async lookupUser(codeOrUsername: string): Promise<UserRecord | null> {
+    const clean = codeOrUsername.trim();
+    const doc = await usersColl.findOne({
+      $or: [
+        { userIdCode: { $regex: `^${clean}$`, $options: "i" } },
+        { username: { $regex: `^${clean}$`, $options: "i" } },
+        { fullName: { $regex: `^${clean}$`, $options: "i" } },
+      ],
+    });
+
+    if (!doc) return null;
+    return {
+      id: doc.id,
+      userIdCode: doc.userIdCode,
+      username: doc.username,
+      email: doc.email,
+      fullName: doc.fullName,
+      passwordHash: doc.passwordHash,
+      avatar: doc.avatar,
+      bio: doc.bio,
+      createdAt: doc.createdAt,
+    };
+  },
+
+  async searchUsers(queryText: string, currentUserId: string): Promise<any[]> {
+    const clean = queryText.trim();
+    if (!clean) return [];
+
+    const escaped = clean.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(escaped, "i");
+
+    const docs = await usersColl
+      .find({
+        id: { $ne: currentUserId },
+        $or: [
+          { username: { $regex: regex } },
+          { fullName: { $regex: regex } },
+          { userIdCode: { $regex: regex } },
+          { email: { $regex: regex } },
+        ],
+      })
+      .limit(20)
+      .toArray();
+
+    const results = await Promise.all(
+      docs.map(async (doc) => {
+        const relationship = await this.getFriendRelationship(currentUserId, doc.id);
+        return {
+          id: doc.id,
+          userIdCode: doc.userIdCode,
+          username: doc.username,
+          fullName: doc.fullName,
+          avatar: doc.avatar,
+          bio: doc.bio,
+          relationship,
+        };
+      })
+    );
+
+    return results;
+  },
+
+  async getAllUsers(currentUserId: string): Promise<any[]> {
+    const docs = await usersColl
+      .find({ id: { $ne: currentUserId } })
+      .limit(50)
+      .toArray();
+
+    const results = await Promise.all(
+      docs.map(async (doc) => {
+        const relationship = await this.getFriendRelationship(currentUserId, doc.id);
+        return {
+          id: doc.id,
+          userIdCode: doc.userIdCode,
+          username: doc.username,
+          fullName: doc.fullName,
+          avatar: doc.avatar,
+          bio: doc.bio,
+          relationship,
+        };
+      })
+    );
+
+    return results;
+  },
+
+  async createUser(user: UserRecord): Promise<UserRecord> {
+    await usersColl.insertOne(user);
+    return user;
+  },
+
+  async updateUserProfile(userId: string, fullName?: string, bio?: string, avatar?: string): Promise<UserRecord | null> {
+    const updateFields: any = {};
+    if (fullName) updateFields.fullName = fullName;
+    if (bio !== undefined) updateFields.bio = bio;
+    if (avatar) updateFields.avatar = avatar;
+
+    await usersColl.updateOne({ id: userId }, { $set: updateFields });
+    return this.findUserById(userId);
+  },
+
+  async areFriends(userId1: string, userId2: string): Promise<boolean> {
+    if (userId1 === userId2) return false;
+    const doc = await friendRequestsColl.findOne({
+      status: "accepted",
+      $or: [
+        { senderId: userId1, receiverId: userId2 },
+        { senderId: userId2, receiverId: userId1 },
+      ],
+    });
+    return Boolean(doc);
+  },
+
+  async getFriendRelationship(currentUserId: string, targetId: string): Promise<"friends" | "pending_sent" | "pending_received" | "none"> {
+    if (currentUserId === targetId) return "none";
+    const doc = await friendRequestsColl.findOne({
+      $or: [
+        { senderId: currentUserId, receiverId: targetId },
+        { senderId: targetId, receiverId: currentUserId },
+      ],
+    });
+
+    if (!doc) return "none";
+    if (doc.status === "accepted") return "friends";
+    return doc.senderId === currentUserId ? "pending_sent" : "pending_received";
+  },
+
+  async sendFriendRequest(senderId: string, receiverId: string): Promise<FriendRequestRecord> {
+    const id = `fr_${crypto.randomUUID().slice(0, 8)}`;
+    const record: FriendRequestRecord = {
+      id,
+      senderId,
+      receiverId,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    };
+
+    await friendRequestsColl.updateOne(
+      { senderId, receiverId },
+      { $set: record },
+      { upsert: true }
+    );
+    return record;
+  },
+
+  async respondFriendRequest(requestId: string, action: "accept" | "reject"): Promise<FriendRequestRecord | null> {
+    const status = action === "accept" ? "accepted" : "rejected";
+    const res = await friendRequestsColl.findOneAndUpdate(
+      { id: requestId },
+      { $set: { status } },
+      { returnDocument: "after" }
+    );
+    return res || null;
+  },
+
+  // Remove / Delete Contact (WhatsApp style)
+  async removeFriend(userId: string, friendId: string): Promise<boolean> {
+    const res = await friendRequestsColl.deleteMany({
+      $or: [
+        { senderId: userId, receiverId: friendId },
+        { senderId: friendId, receiverId: userId },
+      ],
+    });
+    return res.deletedCount > 0;
+  },
+
+  async getFriends(userId: string) {
+    // 1. Accepted friends
+    const acceptedRequests = await friendRequestsColl
+      .find({
+        status: "accepted",
+        $or: [{ senderId: userId }, { receiverId: userId }],
+      })
+      .toArray();
+
+    const friendIds = acceptedRequests.map((fr) => (fr.senderId === userId ? fr.receiverId : fr.senderId));
+    const friendUsersDocs = await usersColl.find({ id: { $in: friendIds } }).toArray();
+
+    const friends = await Promise.all(
+      friendUsersDocs.map(async (u) => {
+        const lastMsg = await messagesColl
+          .find({
+            $or: [
+              { senderId: userId, receiverId: u.id },
+              { senderId: u.id, receiverId: userId },
+            ],
+          })
+          .sort({ timestamp: -1 })
+          .limit(1)
+          .next();
+
+        let preview = null;
+        if (lastMsg) {
+          if (lastMsg.messageType === "image") preview = "📷 Photo";
+          else if (lastMsg.messageType === "file") preview = `📄 ${lastMsg.fileName || "File"}`;
+          else preview = lastMsg.content;
+        }
+
+        return {
+          id: u.id,
+          userIdCode: u.userIdCode,
+          username: u.username,
+          email: u.email,
+          fullName: u.fullName,
+          avatar: u.avatar,
+          bio: u.bio,
+          lastMessage: preview,
+          lastMessageTime: lastMsg ? lastMsg.timestamp : null,
+        };
+      })
+    );
+
+    // 2. Pending Incoming
+    const incomingReqs = await friendRequestsColl.find({ receiverId: userId, status: "pending" }).toArray();
+    const incomingSenderIds = incomingReqs.map((r) => r.senderId);
+    const incomingUsers = await usersColl.find({ id: { $in: incomingSenderIds } }).toArray();
+    const userMap = new Map(incomingUsers.map((u) => [u.id, u]));
+
+    const pendingIncoming = incomingReqs.map((r) => {
+      const u = userMap.get(r.senderId);
+      return {
+        id: r.id,
+        senderId: r.senderId,
+        userIdCode: u?.userIdCode,
+        username: u?.username,
+        fullName: u?.fullName,
+        avatar: u?.avatar,
+        createdAt: r.createdAt,
+      };
+    });
+
+    // 3. Pending Outgoing
+    const outgoingReqs = await friendRequestsColl.find({ senderId: userId, status: "pending" }).toArray();
+    const outgoingReceiverIds = outgoingReqs.map((r) => r.receiverId);
+    const outgoingUsers = await usersColl.find({ id: { $in: outgoingReceiverIds } }).toArray();
+    const outUserMap = new Map(outgoingUsers.map((u) => [u.id, u]));
+
+    const pendingOutgoing = outgoingReqs.map((r) => {
+      const u = outUserMap.get(r.receiverId);
+      return {
+        id: r.id,
+        receiverId: r.receiverId,
+        userIdCode: u?.userIdCode,
+        username: u?.username,
+        fullName: u?.fullName,
+        avatar: u?.avatar,
+        createdAt: r.createdAt,
+      };
+    });
+
+    return { friends, pendingIncoming, pendingOutgoing };
+  },
+
+  async getMessages(user1: string, user2: string): Promise<MessageRecord[]> {
+    const docs = await messagesColl
+      .find({
+        $or: [
+          { senderId: user1, receiverId: user2 },
+          { senderId: user2, receiverId: user1 },
+        ],
+      })
+      .sort({ timestamp: 1 })
+      .toArray();
+
+    return docs.map((d) => ({
+      id: d.id,
+      senderId: d.senderId,
+      receiverId: d.receiverId,
+      content: d.content,
+      messageType: d.messageType,
+      fileUrl: d.fileUrl,
+      fileName: d.fileName,
+      fileSize: d.fileSize,
+      securityScore: d.securityScore,
+      securityLevel: d.securityLevel,
+      threatDetails: d.threatDetails,
+      integrityHash: d.integrityHash,
+      latencyMs: d.latencyMs,
+      timestamp: d.timestamp,
+    }));
+  },
+
+  async insertMessage(msg: MessageRecord): Promise<MessageRecord> {
+    await messagesColl.insertOne(msg);
+
+    setImmediate(async () => {
+      try {
+        const history = await this.getMessages(msg.senderId, msg.receiverId);
+        backupChatToFile(msg.senderId, msg.receiverId, history);
+      } catch (err) {
+        console.error("Backup file error:", err);
+      }
+    });
+
+    return msg;
+  },
+
+  async logDiagnostic(report: DiagnosticRecord) {
+    try {
+      await diagnosticsColl.insertOne(report);
+    } catch (e) {
+      console.error("Diagnostic log insert error:", e);
+    }
+  },
+
+  async getRecentDiagnostics(limit = 25): Promise<DiagnosticRecord[]> {
+    const docs = await diagnosticsColl.find().sort({ timestamp: -1 }).limit(limit).toArray();
+    return docs.map((d) => ({
+      id: d.id,
+      timestamp: d.timestamp,
+      errorCode: d.errorCode,
+      category: d.category,
+      severity: d.severity,
+      title: d.title,
+      rootCause: d.rootCause,
+      recommendedAction: d.recommendedAction,
+      technicalDetails: d.technicalDetails,
+    }));
+  },
+
+  async wipeDatabase(): Promise<void> {
+    await usersColl.deleteMany({});
+    await friendRequestsColl.deleteMany({});
+    await messagesColl.deleteMany({});
+    await diagnosticsColl.deleteMany({});
+    console.log("MongoDB Atlas completely wiped for fresh real user onboarding.");
+  },
+};
